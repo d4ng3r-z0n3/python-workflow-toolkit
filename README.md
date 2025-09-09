@@ -2,7 +2,6 @@
 Cross-platform Python utilities: universal dependency installer and screenshot-to-DOCX generator for streamlined development and documentation workflows.
 **README.md** (Universal Python Installer)
 
-```markdown
 # Universal Python Installer
 
 An intelligent, cross-platform Python environment manager that automatically handles dependencies, virtual environments, and system-level requirements for Python applications.
