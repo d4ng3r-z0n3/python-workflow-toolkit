@@ -187,7 +187,3 @@ Contributions welcome through standard GitHub workflows. Please ensure:
 - Cached virtual environment reuse
 - Minimal overhead for subsequent runs
 - Efficient dependency resolution algorithms
-```
-
-nsure all contributions maintain cross-platform compatibility and include appropriate documentation.
-```
