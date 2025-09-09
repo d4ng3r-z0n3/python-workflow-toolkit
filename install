@@ -1,0 +1,1002 @@
+#!/usr/bin/env python3
+
+import os
+import sys
+import subprocess
+import platform
+import re
+import ast
+import venv
+import traceback
+import shutil
+from pathlib import Path
+
+class Colors:
+   RED = '\033[91m' if os.name != 'nt' else ''
+   GREEN = '\033[92m' if os.name != 'nt' else ''
+   YELLOW = '\033[93m' if os.name != 'nt' else ''
+   BLUE = '\033[94m' if os.name != 'nt' else ''
+   MAGENTA = '\033[95m' if os.name != 'nt' else ''
+   CYAN = '\033[96m' if os.name != 'nt' else ''
+   RESET = '\033[0m' if os.name != 'nt' else ''
+
+def log_info(msg): print(f"{Colors.BLUE}[INFO]{Colors.RESET} {msg}")
+def log_success(msg): print(f"{Colors.GREEN}[SUCCESS]{Colors.RESET} {msg}")
+def log_warning(msg): print(f"{Colors.YELLOW}[WARNING]{Colors.RESET} {msg}")
+def log_error(msg): print(f"{Colors.RED}[ERROR]{Colors.RESET} {msg}")
+def log_skip(msg): print(f"{Colors.YELLOW}[SKIP]{Colors.RESET} {msg}")
+def log_debug(msg): print(f"{Colors.CYAN}[DEBUG]{Colors.RESET} {msg}")
+def log_verbose(msg): print(f"{Colors.MAGENTA}[VERBOSE]{Colors.RESET} {msg}")
+
+def fix_xauthority_issues():
+    """Fix X11 authorization issues for pyautogui."""
+    if platform.system() != 'Linux':
+        return True
+    
+    log_info("Fixing X11 authorization issues...")
+    
+    try:
+        # Get the actual user running the desktop session
+        real_user = os.environ.get('SUDO_USER') or os.environ.get('USER') or 'kasm-user'
+        
+        # Find the real user's DISPLAY and XAUTHORITY
+        display = os.environ.get('DISPLAY', ':0')
+        
+        # Common locations for XAUTHORITY files
+        possible_xauth_paths = [
+            f'/home/{real_user}/.Xauthority',
+            f'/var/run/gdm/auth-for-{real_user}-*/database',
+            f'/run/user/*/gdm/Xauthority',
+            f'/tmp/.X11-unix/X{display.split(":")[1] if ":" in display else "0"}'
+        ]
+        
+        working_xauth = None
+        for path_pattern in possible_xauth_paths:
+            if '*' in path_pattern:
+                # Handle glob patterns
+                import glob
+                matches = glob.glob(path_pattern)
+                for match in matches:
+                    if os.path.exists(match):
+                        working_xauth = match
+                        break
+            else:
+                if os.path.exists(path_pattern):
+                    working_xauth = path_pattern
+                    break
+            
+            if working_xauth:
+                break
+        
+        # Create .Xauthority file for root
+        root_xauth = '/root/.Xauthority'
+        
+        if working_xauth and os.path.exists(working_xauth):
+            log_debug(f"Found working XAUTHORITY: {working_xauth}")
+            # Copy the working auth file to root
+            try:
+                shutil.copy2(working_xauth, root_xauth)
+                os.chmod(root_xauth, 0o600)
+                log_success("Copied XAUTHORITY file to root")
+            except Exception as e:
+                log_debug(f"Could not copy XAUTHORITY: {e}")
+        else:
+            # Create a basic .Xauthority file
+            try:
+                # Create empty file first
+                with open(root_xauth, 'w'):
+                    pass
+                os.chmod(root_xauth, 0o600)
+                
+                # Try to add a basic auth entry
+                hostname = subprocess.run(['hostname'], capture_output=True, text=True).stdout.strip()
+                if hostname:
+                    # Generate random cookie
+                    import secrets
+                    cookie = secrets.token_hex(16)
+                    
+                    # Add auth entries for common displays
+                    auth_commands = [
+                        f'xauth add {hostname}/unix{display} MIT-MAGIC-COOKIE-1 {cookie}',
+                        f'xauth add localhost/unix{display} MIT-MAGIC-COOKIE-1 {cookie}',
+                    ]
+                    
+                    for cmd in auth_commands:
+                        try:
+                            subprocess.run(cmd.split(), capture_output=True, timeout=5)
+                        except:
+                            pass
+                
+                log_success("Created basic XAUTHORITY file")
+            except Exception as e:
+                log_debug(f"Could not create XAUTHORITY: {e}")
+        
+        # Set environment variables
+        os.environ['DISPLAY'] = display
+        os.environ['XAUTHORITY'] = root_xauth
+        
+        return True
+        
+    except Exception as e:
+        log_warning(f"Could not fix X11 authorization: {e}")
+        return False
+
+def fix_broken_packages():
+    """Attempt to fix broken package dependencies automatically."""
+    if platform.system() != 'Linux':
+        return True
+    
+    log_info("Attempting to fix broken package dependencies...")
+    
+    fix_commands = [
+        ['sudo', 'apt', '--fix-broken', 'install', '-y'],
+        ['sudo', 'apt', 'autoremove', '-y'],
+        ['sudo', 'apt', 'autoclean'],
+        ['sudo', 'dpkg', '--configure', '-a'],
+    ]
+    
+    for cmd in fix_commands:
+        try:
+            log_debug(f"Running: {' '.join(cmd)}")
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+            if result.returncode == 0:
+                log_debug(f"✓ {' '.join(cmd)} succeeded")
+            else:
+                log_debug(f"✗ {' '.join(cmd)} failed: {result.stderr}")
+        except Exception as e:
+            log_debug(f"Error running {' '.join(cmd)}: {e}")
+    
+    return True
+
+def find_working_screenshot_tool():
+    """Find and install a working screenshot tool automatically."""
+    if platform.system() != 'Linux':
+        return True
+    
+    screenshot_options = [
+        {
+            'name': 'imagemagick',
+            'package': 'imagemagick',
+            'binary': 'import',
+            'test_cmd': ['import', '--version']
+        },
+        {
+            'name': 'maim', 
+            'package': 'maim',
+            'binary': 'maim',
+            'test_cmd': ['maim', '--version']
+        },
+        {
+            'name': 'xfce4-screenshooter',
+            'package': 'xfce4-screenshooter', 
+            'binary': 'xfce4-screenshooter',
+            'test_cmd': ['xfce4-screenshooter', '--version']
+        }
+    ]
+    
+    log_info("Looking for compatible screenshot tools...")
+    
+    for tool in screenshot_options:
+        if shutil.which(tool['binary']):
+            log_success(f"Found working screenshot tool: {tool['name']}")
+            return True
+    
+    for tool in screenshot_options:
+        log_info(f"Trying to install {tool['name']}...")
+        
+        try:
+            result = subprocess.run([
+                'sudo', 'apt', 'install', '-y', tool['package']
+            ], capture_output=True, text=True, timeout=180)
+            
+            if result.returncode == 0:
+                try:
+                    test_result = subprocess.run(
+                        tool['test_cmd'], 
+                        capture_output=True, 
+                        text=True, 
+                        timeout=10
+                    )
+                    if test_result.returncode == 0:
+                        log_success(f"Successfully installed {tool['name']}")
+                        return True
+                except:
+                    pass
+            
+            log_debug(f"Failed to install {tool['name']}: {result.stderr}")
+            
+        except Exception as e:
+            log_debug(f"Error installing {tool['name']}: {e}")
+    
+    log_warning("Could not install any screenshot tools")
+    return False
+
+def execute_system_commands_enhanced(commands):
+    """Enhanced system command execution with automatic fixes."""
+    if not commands:
+        log_info("No system installation commands found")
+        return True
+    
+    if platform.system() != 'Linux':
+        log_skip("System package installation only supported on Linux")
+        return True
+    
+    log_info(f"Found {len(commands)} system installation commands")
+    
+    response = input(f"Attempt automatic system package installation? [y/N]: ").strip().lower()
+    if response not in ['y', 'yes']:
+        log_warning("System package installation skipped by user")
+        return False
+    
+    fix_broken_packages()
+    
+    success = execute_system_commands(commands)
+    
+    if not success:
+        log_info("Standard installation failed, trying compatibility mode...")
+        success = find_working_screenshot_tool()
+    
+    return success
+
+def is_python_script(file_path):
+   file_path = Path(file_path)
+   
+   if file_path.suffix in ['.py', '.pyw', '.py3', '.python']:
+       return True
+   
+   if not file_path.exists() or not file_path.is_file():
+       return False
+   
+   try:
+       with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+           first_line = f.readline().strip()
+           if first_line.startswith('#!') and 'python' in first_line:
+               return True
+           
+           f.seek(0)
+           content = f.read(2000)
+           
+           patterns = [
+               r'^\s*import\s+\w+',
+               r'^\s*from\s+\w+\s+import',
+               r'^\s*def\s+\w+\s*\(',
+               r'^\s*class\s+\w+',
+               r'if\s+__name__\s*==\s*[\'"]__main__[\'"]',
+               r'print\s*\(',
+               r'#.*coding[:=]|#.*encoding[:=]',
+               r'""".*"""',
+               r'__version__|__author__|__email__',
+               r'\b(True|False|None)\b.*[:=]'
+           ]
+           
+           for pattern in patterns:
+               if re.search(pattern, content, re.MULTILINE):
+                   return True
+                   
+   except Exception as e:
+       log_debug(f"Error checking if {file_path} is Python script: {e}")
+   
+   return False
+
+def find_python_script(script_dir, target_script=None):
+   if target_script:
+       if Path(target_script).exists():
+           return Path(target_script)
+       elif (script_dir / target_script).exists():
+           return script_dir / target_script
+   
+   for file_path in script_dir.iterdir():
+       if file_path.is_file() and file_path.name != Path(__file__).name:
+           if is_python_script(file_path):
+               return file_path
+   
+   return None
+
+def extract_imports(script_path):
+   imports = set()
+   
+   try:
+       log_debug(f"Extracting imports from {script_path}")
+       with open(script_path, 'r', encoding='utf-8', errors='ignore') as f:
+           content = f.read()
+       
+       try:
+           tree = ast.parse(content)
+           for node in ast.walk(tree):
+               if isinstance(node, ast.Import):
+                   for alias in node.names:
+                       imports.add(alias.name.split('.')[0])
+               elif isinstance(node, ast.ImportFrom):
+                   if node.module:
+                       imports.add(node.module.split('.')[0])
+       except SyntaxError as e:
+           log_warning(f"AST parsing failed, using regex fallback: {e}")
+           import_patterns = [
+               r'^\s*import\s+([a-zA-Z0-9_,\s.]+)',
+               r'^\s*from\s+([a-zA-Z0-9_]+)\s+import'
+           ]
+           
+           for line in content.split('\n'):
+               for pattern in import_patterns:
+                   match = re.match(pattern, line.strip())
+                   if match:
+                       if 'import' in pattern and 'from' not in pattern:
+                           for imp in match.group(1).split(','):
+                               clean_imp = imp.strip().split('.')[0].split(' as ')[0]
+                               if clean_imp:
+                                   imports.add(clean_imp)
+                       else:
+                           imports.add(match.group(1))
+   
+   except Exception as e:
+       log_error(f"Could not parse imports from {script_path}: {e}")
+       log_debug(f"Traceback: {traceback.format_exc()}")
+   
+   return sorted(imports)
+
+def extract_system_commands(script_path):
+    """Extract system installation commands from script comments."""
+    commands = []
+    
+    try:
+        log_debug(f"Extracting system commands from {script_path}")
+        with open(script_path, 'r', encoding='utf-8', errors='ignore') as f:
+            content = f.read()
+        
+        # Look for package manager commands in comments
+        command_patterns = [
+            r'#\s*(sudo\s+apt\s+(?:update\s+&&\s+)?sudo\s+apt\s+install\s+.+)',
+            r'#\s*(apt\s+install\s+.+)',
+            r'#\s*(sudo\s+apt\s+install\s+.+)',
+            r'#\s*(pacman\s+-S\s+.+)',
+            r'#\s*(sudo\s+pacman\s+-S\s+.+)',
+            r'#\s*(dnf\s+install\s+.+)',
+            r'#\s*(sudo\s+dnf\s+install\s+.+)',
+            r'#\s*(yum\s+install\s+.+)',
+            r'#\s*(brew\s+install\s+.+)',
+        ]
+        
+        for line in content.split('\n'):
+            line = line.strip()
+            for pattern in command_patterns:
+                match = re.search(pattern, line, re.IGNORECASE)
+                if match:
+                    command = match.group(1).strip()
+                    commands.append(command)
+        
+    except Exception as e:
+        log_error(f"Could not extract system commands from {script_path}: {e}")
+    
+    return commands
+
+def execute_system_commands(commands):
+    """Execute system installation commands."""
+    if not commands:
+        log_info("No system installation commands found")
+        return True
+    
+    if platform.system() != 'Linux':
+        log_skip("System package installation only supported on Linux")
+        return True
+    
+    log_info(f"Found {len(commands)} system installation commands:")
+    for cmd in commands:
+        log_info(f"  {cmd}")
+    
+    # Ask for user permission
+    response = input(f"Execute these system installation commands? [y/N]: ").strip().lower()
+    if response not in ['y', 'yes']:
+        log_warning("System package installation skipped by user")
+        return False
+    
+    success = True
+    for command in commands:
+        log_info(f"Executing: {command}")
+        
+        try:
+            # Split command into parts
+            cmd_parts = command.split()
+            
+            # Handle command chaining with &&
+            if '&&' in cmd_parts:
+                # Split on && and execute sequentially
+                commands_chain = ' '.join(cmd_parts).split(' && ')
+                for sub_cmd in commands_chain:
+                    sub_cmd_parts = sub_cmd.strip().split()
+                    result = subprocess.run(sub_cmd_parts, capture_output=False, text=True, timeout=300)
+                    if result.returncode != 0:
+                        log_error(f"Command failed: {sub_cmd}")
+                        success = False
+                        break
+            else:
+                result = subprocess.run(cmd_parts, capture_output=False, text=True, timeout=300)
+                if result.returncode != 0:
+                    log_error(f"Command failed: {command}")
+                    success = False
+            
+        except subprocess.TimeoutExpired:
+            log_error(f"Command timed out: {command}")
+            success = False
+        except Exception as e:
+            log_error(f"Error executing command '{command}': {e}")
+            success = False
+    
+    return success
+
+def get_python_command():
+   is_windows = platform.system() == 'Windows'
+   
+   commands = ['python3', 'python', 'py'] if not is_windows else ['py', 'python', 'python3']
+   
+   for cmd in commands:
+       try:
+           log_debug(f"Trying Python command: {cmd}")
+           result = subprocess.run([cmd, '--version'], capture_output=True, text=True, timeout=10)
+           if result.returncode == 0 and 'Python 3' in result.stdout:
+               log_debug(f"Found working Python: {cmd} -> {result.stdout.strip()}")
+               return cmd
+           else:
+               log_debug(f"Command {cmd} failed or not Python 3: {result.stderr}")
+       except FileNotFoundError:
+           log_debug(f"Command {cmd} not found")
+       except subprocess.TimeoutExpired:
+           log_debug(f"Command {cmd} timed out")
+       except Exception as e:
+           log_debug(f"Error testing {cmd}: {e}")
+   
+   log_error("Python 3 not found. Please install Python 3 from https://python.org")
+   sys.exit(1)
+
+def fix_tkinter_directories(venv_path):
+    if platform.system() != 'Windows':
+        return True
+    
+    log_info("Fixing Tkinter directories dynamically...")
+    
+    try:
+        system_python_root = None
+        
+        # Method 1: Use sys.base_prefix (most reliable)
+        base_prefix = Path(sys.base_prefix)
+        if base_prefix.exists() and (base_prefix / "python.exe").exists():
+            system_python_root = base_prefix
+            log_debug(f"Found system Python via sys.base_prefix: {system_python_root}")
+        
+        # Method 2: Check if running from venv, get parent system Python
+        if not system_python_root:
+            if 'venv' in str(sys.executable) or 'Scripts' in str(sys.executable):
+                potential_root = Path(sys.executable).parent.parent.parent
+                if (potential_root / "python.exe").exists():
+                    system_python_root = potential_root
+                    log_debug(f"Found system Python via venv path: {system_python_root}")
+        
+        # Method 3: Check common installation paths
+        if not system_python_root:
+            username = os.environ.get('USERNAME', '')
+            common_paths = [
+                Path(f"C:/Users/{username}/AppData/Local/Programs/Python"),
+                Path("C:/Python313"),
+                Path("C:/Python312"),
+                Path("C:/Python311"),
+                Path("C:/Python310"),
+                Path("C:/Program Files/Python313"),
+                Path("C:/Program Files/Python312"),
+            ]
+            
+            for base_path in common_paths:
+                if base_path.exists():
+                    for subdir in base_path.iterdir():
+                        if subdir.is_dir() and (subdir / "python.exe").exists():
+                            system_python_root = subdir
+                            log_debug(f"Found system Python in common paths: {system_python_root}")
+                            break
+                if system_python_root:
+                    break
+        
+        # Method 4: Use Windows registry
+        if not system_python_root:
+            try:
+                import winreg
+                with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Python\PythonCore") as key:
+                    for i in range(10):
+                        try:
+                            version = winreg.EnumKey(key, i)
+                            with winreg.OpenKey(key, f"{version}\\InstallPath") as install_key:
+                                install_path, _ = winreg.QueryValueEx(install_key, "")
+                                potential_root = Path(install_path)
+                                if potential_root.exists() and (potential_root / "python.exe").exists():
+                                    system_python_root = potential_root
+                                    log_debug(f"Found system Python via registry: {system_python_root}")
+                                    break
+                        except OSError:
+                            continue
+            except ImportError:
+                log_debug("winreg not available")
+        
+        if not system_python_root:
+            log_warning("Could not find system Python installation")
+            return False
+        
+        system_tcl_dir = system_python_root / "tcl"
+        
+        if not system_tcl_dir.exists():
+            log_warning(f"System TCL directory not found: {system_tcl_dir}")
+            return False
+        
+        venv_tcl_dir = venv_path / "tcl"
+        
+        if not venv_tcl_dir.exists():
+            log_debug(f"Copying {system_tcl_dir} to {venv_tcl_dir}")
+            shutil.copytree(system_tcl_dir, venv_tcl_dir)
+            log_success(f"TCL directory copied from {system_tcl_dir} to virtual environment")
+        else:
+            log_skip("TCL directory already exists in venv")
+        
+        return True
+        
+    except Exception as e:
+        log_warning(f"Could not fix Tkinter directories: {e}")
+        log_debug(f"Traceback: {traceback.format_exc()}")
+        return False
+
+def create_virtual_environment(venv_path, python_cmd):
+   if venv_path.exists():
+       log_skip("Virtual environment already exists")
+       
+       if platform.system() == 'Windows':
+           fix_tkinter_directories(venv_path)
+       
+       return True
+   
+   log_info(f"Creating virtual environment at: {venv_path}")
+   try:
+       log_debug(f"Using venv.create with path: {venv_path}")
+       venv.create(venv_path, with_pip=True)
+       log_success("Virtual environment created")
+       
+       if platform.system() == 'Windows':
+           fix_tkinter_directories(venv_path)
+       
+       python_exe = get_venv_python(venv_path)
+       if python_exe.exists():
+           log_debug(f"Verified Python executable exists: {python_exe}")
+           return True
+       else:
+           log_error(f"Python executable not found after venv creation: {python_exe}")
+           return False
+           
+   except Exception as e:
+       log_error(f"Failed to create virtual environment: {e}")
+       log_debug(f"Traceback: {traceback.format_exc()}")
+       return False
+
+def get_venv_python(venv_path):
+   is_windows = platform.system() == 'Windows'
+   
+   if is_windows:
+       return venv_path / 'Scripts' / 'python.exe'
+   else:
+       return venv_path / 'bin' / 'python'
+
+def get_venv_pip(venv_path):
+   is_windows = platform.system() == 'Windows'
+   
+   if is_windows:
+       return venv_path / 'Scripts' / 'pip.exe'
+   else:
+       return venv_path / 'bin' / 'pip'
+
+def test_tkinter(venv_path):
+   python_exe = get_venv_python(venv_path)
+   log_debug("Testing tkinter import...")
+   
+   try:
+       env = dict(os.environ)
+       if platform.system() == 'Windows':
+           env.update({
+               'TCL_LIBRARY': str(venv_path / 'tcl' / 'tcl8.6'),
+               'TK_LIBRARY': str(venv_path / 'tcl' / 'tk8.6')
+           })
+       
+       result = subprocess.run(
+           [str(python_exe), '-c', 'import tkinter; print("Tkinter OK")'],
+           capture_output=True,
+           text=True,
+           timeout=10,
+           env=env
+       )
+       
+       if result.returncode == 0:
+           log_success("✓ Tkinter test passed")
+           return True
+       else:
+           log_warning(f"✗ Tkinter test failed: {result.stderr}")
+           return False
+           
+   except Exception as e:
+       log_warning(f"✗ Tkinter test error: {e}")
+       return False
+
+def test_imports(venv_path, modules):
+   python_exe = get_venv_python(venv_path)
+   log_debug(f"Testing imports with Python: {python_exe}")
+   
+   env = dict(os.environ)
+   if platform.system() == 'Windows':
+       env.update({
+           'TCL_LIBRARY': str(venv_path / 'tcl' / 'tcl8.6'),
+           'TK_LIBRARY': str(venv_path / 'tcl' / 'tk8.6')
+       })
+   
+   for module in modules:
+       try:
+           result = subprocess.run(
+               [str(python_exe), '-c', f'import {module}; print(f"{module} OK")'],
+               capture_output=True,
+               text=True,
+               timeout=30,
+               env=env
+           )
+           if result.returncode == 0:
+               log_debug(f"✓ {module} import successful")
+           else:
+               log_warning(f"✗ {module} import failed: {result.stderr.strip()}")
+       except Exception as e:
+           log_warning(f"✗ {module} import test error: {e}")
+
+def install_packages(venv_path, imports, script_dir):
+   pip_cmd = get_venv_pip(venv_path)
+   log_debug(f"Using pip: {pip_cmd}")
+   
+   if not pip_cmd.exists():
+       log_error(f"Pip executable not found: {pip_cmd}")
+       return False
+   
+   req_file = script_dir / 'requirements.txt'
+   if req_file.exists():
+       log_info("Installing from requirements.txt...")
+       log_verbose(f"Requirements file: {req_file}")
+       try:
+           result = subprocess.run(
+               [str(pip_cmd), 'install', '-r', str(req_file), '-v'],
+               capture_output=False,
+               text=True
+           )
+           if result.returncode == 0:
+               log_success("Requirements installed successfully")
+           else:
+               log_error(f"Requirements installation failed with code {result.returncode}")
+           return result.returncode == 0
+       except Exception as e:
+           log_error(f"Error installing requirements: {e}")
+           return False
+   
+   module_map = {
+       'cv2': 'opencv-python',
+       'PIL': 'Pillow',
+       'PyQt5': 'PyQt5',
+       'PyQt6': 'PyQt6',
+       'requests': 'requests',
+       'flask': 'Flask',
+       'django': 'Django',
+       'bs4': 'beautifulsoup4',
+       'numpy': 'numpy',
+       'pandas': 'pandas',
+       'scipy': 'scipy',
+       'sklearn': 'scikit-learn',
+       'matplotlib': 'matplotlib',
+       'seaborn': 'seaborn',
+       'tensorflow': 'tensorflow',
+       'torch': 'torch',
+       'keras': 'keras',
+       'pymongo': 'pymongo',
+       'psycopg2': 'psycopg2-binary',
+       'sqlalchemy': 'SQLAlchemy',
+       'yaml': 'PyYAML',
+       'docx': 'python-docx',
+       'pptx': 'python-pptx',
+       'pyautogui': 'pyautogui',
+       'cryptography': 'cryptography',
+       'psutil': 'psutil',
+       'discord': 'discord.py',
+       'boto3': 'boto3',
+       'pygame': 'pygame',
+       'nltk': 'nltk',
+       'spacy': 'spacy',
+       'click': 'click',
+       'colorama': 'colorama',
+       'tqdm': 'tqdm',
+       'rich': 'rich',
+       'jinja2': 'Jinja2',
+   }
+   
+   stdlib_modules = {
+       'os', 'sys', 're', 'json', 'time', 'datetime', 'urllib', 'http', 
+       'socket', 'threading', 'subprocess', 'argparse', 'logging', 'pathlib',
+       'collections', 'itertools', 'functools', 'math', 'random', 'string',
+       'io', 'base64', 'hashlib', 'hmac', 'ssl', 'email', 'html', 'xml',
+       'csv', 'sqlite3', 'pickle', 'gzip', 'shutil', 'glob', 'fnmatch',
+       'tempfile', 'configparser', 'uuid', 'platform', 'getpass', 'pwd',
+       'grp', 'stat', 'errno', 'signal', 'atexit', 'traceback', 'warnings',
+       'inspect', 'types', 'weakref', 'copy', 'operator', 'keyword', 'ast',
+       'dis', 'gc', 'ctypes', 'struct', 'array', 'mmap', 'fcntl', 'termios',
+       'tty', 'pty', 'select', 'resource', 'syslog', 'tkinter', 'turtle',
+       'queue', '_tkinter', 'webbrowser', 'unittest', 'doctest', 'pdb',
+       'profile', 'pstats', 'timeit', 'trace', 'calendar', 'cmd', 'shlex',
+       'textwrap', 'codecs', 'unicodedata', 'stringprep', 'readline',
+       'rlcompleter', 'zipfile', 'tarfile', 'bz2', 'lzma', 'zlib'
+   }
+   
+   external_modules = [mod for mod in imports if mod not in stdlib_modules]
+   
+   if not external_modules:
+       log_info("No external modules to install")
+       return True
+   
+   log_info(f"Installing {len(external_modules)} external modules: {external_modules}")
+   
+   python_cmd = get_venv_python(venv_path)
+   
+   env = dict(os.environ)
+   if platform.system() == 'Windows':
+       env.update({
+           'TCL_LIBRARY': str(venv_path / 'tcl' / 'tcl8.6'),
+           'TK_LIBRARY': str(venv_path / 'tcl' / 'tk8.6')
+       })
+   
+   for module in external_modules:
+       log_debug(f"Testing if {module} is already installed...")
+       try:
+           result = subprocess.run(
+               [str(python_cmd), '-c', f'import {module}'],
+               capture_output=True,
+               text=True,
+               timeout=30,
+               env=env
+           )
+           if result.returncode == 0:
+               log_skip(f"Module {module} already available")
+               continue
+       except Exception as e:
+           log_debug(f"Error testing {module}: {e}")
+       
+       log_info(f"Installing module: {module}")
+       
+       package = module_map.get(module, module)
+       log_verbose(f"Package name: {package}")
+       
+       try:
+           result = subprocess.run(
+               [str(pip_cmd), 'install', package, '-v'],
+               capture_output=False,
+               text=True
+           )
+           
+           if result.returncode == 0:
+               log_success(f"Installed {package}")
+               
+               log_debug(f"Testing import of {module}...")
+               test_result = subprocess.run(
+                   [str(python_cmd), '-c', f'import {module}; print("Import successful")'],
+                   capture_output=True,
+                   text=True,
+                   timeout=30,
+                   env=env
+               )
+               if test_result.returncode == 0:
+                   log_debug(f"✓ {module} import test passed")
+               else:
+                   log_warning(f"✗ {module} import test failed: {test_result.stderr}")
+           else:
+               log_error(f"Failed to install {package} (exit code: {result.returncode})")
+               
+       except Exception as e:
+           log_error(f"Exception during installation of {package}: {e}")
+           log_debug(f"Traceback: {traceback.format_exc()}")
+   
+   log_info("Running final import tests...")
+   test_tkinter(venv_path)
+   test_imports(venv_path, external_modules)
+   
+   return True
+
+def create_desktop_launcher(script_path, venv_path):
+   if platform.system() != 'Linux':
+       return
+   
+   script_name = script_path.stem
+   desktop_dir = Path.home() / 'Desktop'
+   
+   if not desktop_dir.exists():
+       return
+   
+   launcher_path = desktop_dir / f"{script_name.title()}.desktop"
+   python_exe = get_venv_python(venv_path)
+   
+   launcher_content = f"""[Desktop Entry]
+Version=1.0
+Type=Application
+Name={script_name.title()}
+Comment=Python Application: {script_name}
+Exec={python_exe} {script_path}
+Icon=python
+Terminal=true
+StartupNotify=true
+Categories=Development;Utility;Application;
+Path={script_path.parent}
+"""
+   
+   try:
+       with open(launcher_path, 'w') as f:
+           f.write(launcher_content)
+       launcher_path.chmod(0o755)
+       log_success(f"Created desktop launcher: {launcher_path}")
+   except Exception as e:
+       log_warning(f"Could not create desktop launcher: {e}")
+
+def needs_elevated_privileges(script_path):
+   try:
+       with open(script_path, 'r', encoding='utf-8', errors='ignore') as f:
+           content = f.read()
+       
+       patterns = [
+           r'sudo|su\s+',
+           r'openvpn',
+           r'nmap.*-sS',
+           r'scapy',
+           r'root|administrator',
+           r'privileged|elevation'
+       ]
+       
+       for pattern in patterns:
+           if re.search(pattern, content, re.IGNORECASE):
+               return True
+   except Exception:
+       pass
+   
+   return False
+
+def run_script_with_debugging(script_path, venv_path, args):
+   python_exe = get_venv_python(venv_path)
+   
+   if platform.system() == 'Windows':
+       fix_tkinter_directories(venv_path)
+   
+   log_verbose(f"Script path: {script_path}")
+   log_verbose(f"Python executable: {python_exe}")
+   log_verbose(f"Working directory: {script_path.parent}")
+   log_verbose(f"Arguments: {args}")
+   
+   if not script_path.exists():
+       log_error(f"Script file does not exist: {script_path}")
+       return 1
+   
+   try:
+       result = subprocess.run([str(python_exe), '--version'], capture_output=True, text=True)
+       log_debug(f"Python version in venv: {result.stdout.strip()}")
+   except Exception as e:
+       log_error(f"Cannot run Python executable: {e}")
+       return 1
+   
+   env = dict(os.environ)
+   if platform.system() == 'Windows':
+       venv_tcl_dir = venv_path / "tcl"
+       if venv_tcl_dir.exists():
+           tcl8_6_path = venv_tcl_dir / "tcl8.6"
+           tk8_6_path = venv_tcl_dir / "tk8.6"
+           
+           if tcl8_6_path.exists():
+               env['TCL_LIBRARY'] = str(tcl8_6_path)
+               log_debug(f"Set TCL_LIBRARY={tcl8_6_path}")
+           if tk8_6_path.exists():
+               env['TK_LIBRARY'] = str(tk8_6_path)
+               log_debug(f"Set TK_LIBRARY={tk8_6_path}")
+   
+   cmd = [str(python_exe), str(script_path)] + args
+   log_verbose(f"Running command: {' '.join(cmd)}")
+   
+   try:
+       original_cwd = os.getcwd()
+       os.chdir(script_path.parent)
+       log_debug(f"Changed working directory to: {script_path.parent}")
+       
+       process = subprocess.Popen(
+           cmd,
+           stdout=subprocess.PIPE,
+           stderr=subprocess.STDOUT,
+           text=True,
+           bufsize=1,
+           universal_newlines=True,
+           env=env
+       )
+       
+       for line in process.stdout:
+           print(line, end='')
+       
+       process.wait()
+       exit_code = process.returncode
+       
+       os.chdir(original_cwd)
+       
+       return exit_code
+       
+   except KeyboardInterrupt:
+       log_warning("Script interrupted by user (Ctrl+C)")
+       return 1
+   except Exception as e:
+       log_error(f"Error running script: {e}")
+       log_debug(f"Traceback: {traceback.format_exc()}")
+       return 1
+
+def main():
+   script_dir = Path(__file__).parent.absolute()
+   log_info(f"Working directory: {script_dir}")
+   log_debug(f"Platform: {platform.system()} {platform.release()}")
+   log_debug(f"Python version: {sys.version}")
+   
+   target_script = sys.argv[1] if len(sys.argv) > 1 else None
+   py_script = find_python_script(script_dir, target_script)
+   
+   if not py_script:
+       log_error("No Python script found. Available files:")
+       for file in script_dir.iterdir():
+           if file.is_file():
+               print(f"  {file.name}")
+       sys.exit(1)
+   
+   log_success(f"Found Python script: {py_script.name}")
+   
+   python_cmd = get_python_command()
+   log_info(f"Using Python: {python_cmd}")
+   
+   # Fix X11 authorization issues first
+   fix_xauthority_issues()
+   
+   # Extract system commands and execute them with enhanced handling
+   system_commands = extract_system_commands(py_script)
+   if system_commands:
+       if not execute_system_commands_enhanced(system_commands):
+           log_warning("System package installation failed, continuing anyway...")
+   
+   # Continue with Python environment setup
+   imports = extract_imports(py_script)
+   log_info(f"Found {len(imports)} unique imports: {', '.join(imports)}")
+   
+   venv_path = script_dir / 'venv'
+   if not create_virtual_environment(venv_path, python_cmd):
+       sys.exit(1)
+   
+   if not install_packages(venv_path, imports, script_dir):
+       log_warning("Some packages may not have installed correctly")
+   
+   if 'tkinter' in imports:
+       log_info("Testing Tkinter configuration...")
+       if not test_tkinter(venv_path):
+           log_warning("Tkinter test failed - GUI may not work properly")
+           if platform.system() == 'Windows':
+               log_info("Attempting to re-fix Tkinter...")
+               fix_tkinter_directories(venv_path)
+               test_tkinter(venv_path)
+   
+   create_desktop_launcher(py_script, venv_path)
+   
+   needs_sudo = needs_elevated_privileges(py_script)
+   if needs_sudo:
+       log_warning("Script may need elevated privileges")
+   
+   log_info(f"Starting Python script: {py_script.name}")
+   print("=" * 40)
+   
+   exit_code = run_script_with_debugging(py_script, venv_path, sys.argv[2:])
+   
+   print("=" * 40)
+   
+   if exit_code == 0:
+       log_success("Script completed successfully")
+   else:
+       log_error(f"Script exited with code {exit_code}")
+   
+   sys.exit(exit_code)
+
+if __name__ == '__main__':
+   main()
